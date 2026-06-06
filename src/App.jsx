@@ -3,11 +3,10 @@ import { AppProvider, useApp } from './lib/AppContext'
 import Login from './pages/Login'
 import Sidebar from './components/Sidebar'
 import Dashboard from './pages/Dashboard'
-import Dispatch from './pages/Dispatch'
+import Orders from './pages/Orders'
 import Inventory from './pages/Inventory'
 import Returns from './pages/Returns'
 import { History, Settings } from './pages/HistorySettings'
-import MeeshoOrders from './pages/MeeshoOrders'
 import { Spinner } from './components/ui'
 import { today } from './lib/constants'
 
@@ -27,7 +26,7 @@ function Shell() {
 
   if (!user) return <Login />
 
-  const titles = { dashboard: 'Dashboard', dispatch: 'Dispatch Plan', 'meesho-orders': 'Meesho Orders', inventory: 'Inventory', returns: 'Returns', history: 'Order History', settings: 'Settings' }
+  const titles = { dashboard: 'Dashboard', orders: 'Orders', inventory: 'Inventory', returns: 'Returns', history: 'Order History', settings: 'Settings' }
 
   function handleSetPage(p) {
     setPage(p)
@@ -52,7 +51,7 @@ function Shell() {
         {/* Content */}
         <div style={{ padding: '1.5rem' }}>
           {page === 'dashboard' && <Dashboard setPage={handleSetPage} />}
-          {page === 'dispatch'  && <Dispatch initialDate={dispatchDate} setPage={handleSetPage} />}
+          {page === 'orders' && <Orders initialDate={dispatchDate} setPage={handleSetPage} />}
           {page === 'inventory' && <Inventory />}
           {page === 'returns'   && <Returns />}
           {page === 'meesho-orders' && <MeeshoOrders />}

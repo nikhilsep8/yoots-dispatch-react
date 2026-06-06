@@ -2,13 +2,12 @@ import { useApp } from '../lib/AppContext'
 import { sb } from '../lib/supabase'
 
 const NAV = [
-  { id: 'dashboard',     icon: '📊', label: 'Dashboard'     },
-  { id: 'dispatch',      icon: '🚚', label: 'Dispatch'      },
-  { id: 'meesho-orders', icon: '🟣', label: 'Meesho Orders' },
-  { id: 'inventory',     icon: '📦', label: 'Inventory'     },
-  { id: 'returns',       icon: '↩️', label: 'Returns'       },
-  { id: 'history',       icon: '📋', label: 'History'       },
-  { id: 'settings',      icon: '⚙️', label: 'Settings'      },
+  { id: 'dashboard', icon: '📊', label: 'Dashboard' },
+  { id: 'orders',    icon: '🚚', label: 'Orders'    },
+  { id: 'inventory', icon: '📦', label: 'Inventory' },
+  { id: 'returns',   icon: '↩️', label: 'Returns'   },
+  { id: 'history',   icon: '📋', label: 'History'   },
+  { id: 'settings',  icon: '⚙️', label: 'Settings'  },
 ]
 
 export default function Sidebar({ page, setPage }) {
