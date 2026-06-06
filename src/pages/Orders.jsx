@@ -33,6 +33,11 @@ export default function Orders({ initialDate, setPage }) {
   const [msOrders, setMsOrders]     = useState([])
   const [msHint, setMsHint]         = useState('')
   const msFileRef = useRef()
+  // Meesho CSV stock deduction state
+  const msCsvRef = useRef()
+  const [msCsvRows, setMsCsvRows]   = useState([])
+  const [msCsvHint, setMsCsvHint]   = useState('')
+  const [msCsvSaving, setMsCsvSaving] = useState(false)
 
   // Manual entry state (Amazon/Myntra)
   const [manPlat,  setManPlat]      = useState('Amazon')
@@ -169,6 +174,88 @@ export default function Orders({ initialDate, setPage }) {
       if (parsed) for (let q = 0; q < qty; q++) rows.push({ platform: 'Meesho', ...parsed })
     }
     return rows
+  }
+
+  // ── Meesho Orders CSV parser (stock deduction) ───
+  function handleMsCsvFile(file) {
+    if (!file) return
+    setMsCsvHint('Parsing ' + file.name + '…')
+    const reader = new FileReader()
+    reader.onload = e => {
+      try { parseMsCsv(e.target.result, file.name) }
+      catch (err) { setMsCsvHint('Error: ' + err.message) }
+    }
+    reader.readAsText(file, 'utf-8')
+  }
+
+  function parseMsCsv(text, fname) {
+    const lines = text.replace(/^﻿/,'').split('\n').map(l=>l.trim()).filter(l=>l)
+    if (!lines.length) { setMsCsvHint('File is empty'); return }
+    const headers = csvSplit(lines[0]).map(h=>h.trim())
+    const idx = name => headers.findIndex(h=>h.toLowerCase().includes(name.toLowerCase()))
+    const iSKU = idx('SKU'), iSize = idx('Size'), iQty = idx('Quantity'), iStatus = idx('Reason for Credit')
+    if (iSKU < 0) { setMsCsvHint('Not a valid Meesho orders CSV'); return }
+    const rows = []
+    for (let i = 1; i < lines.length; i++) {
+      const cols = csvSplit(lines[i])
+      if (cols.length < 3) continue
+      const sku = cols[iSKU]?.trim() || ''
+      const sizeStr = iSize >= 0 ? cols[iSize]?.trim() : ''
+      const qty = iQty >= 0 ? (parseInt(cols[iQty]) || 1) : 1
+      const status = iStatus >= 0 ? cols[iStatus]?.trim().toUpperCase().replace(/\s+/g,'_') : 'SHIPPED'
+      const parsed = parseYootsSKU(sku, whInv, sizeStr)
+      if (!parsed) continue
+      for (let q = 0; q < qty; q++) rows.push({ ...parsed, platform: 'Meesho', status })
+    }
+    if (!rows.length) { setMsCsvHint('No valid SKUs found'); return }
+    setMsCsvHint(`✓ ${rows.length} orders parsed — all will deduct stock`)
+    setMsCsvRows(rows)
+  }
+
+  async function confirmMsCsvDeduct() {
+    if (!msCsvRows.length) return
+    if (!confirm(`Deduct stock for ${msCsvRows.length} Meesho orders?\nThis cannot be undone.`)) return
+    setMsCsvSaving(true)
+    try {
+      const priority = (settings.dispatch_priority||'huda_complex,aggarsain,huda_new').split(',')
+      const whByCode = {}; warehouses.forEach(w => { whByCode[w.code] = w })
+      const whPrio = [...priority.map(c=>whByCode[c]).filter(Boolean), ...warehouses.filter(w=>!priority.includes(w.code))]
+      const newWhInv = whInv.map(r => ({ ...r }))
+      const updates = {}
+      for (const row of msCsvRows) {
+        let rem = 1
+        for (const wh of whPrio) {
+          if (rem <= 0) break
+          const idx = newWhInv.findIndex(r => r.warehouse_id===wh.id && r.model===row.model && r.color===row.color && r.size===row.size)
+          if (idx >= 0 && newWhInv[idx].stock > 0) {
+            newWhInv[idx] = { ...newWhInv[idx], stock: newWhInv[idx].stock - 1 }
+            rem--
+            const k = `${wh.id}|${row.model}|${row.color}|${row.size}`
+            updates[k] = { warehouse_id: wh.id, model: row.model, color: row.color, size: row.size, stock: newWhInv[idx].stock, reorder_level: newWhInv[idx].reorder_level || 10 }
+          }
+        }
+        if (rem > 0) {
+          const wh = whPrio[0]
+          if (wh) {
+            const idx = newWhInv.findIndex(r => r.warehouse_id===wh.id && r.model===row.model && r.color===row.color && r.size===row.size)
+            if (idx >= 0) {
+              newWhInv[idx] = { ...newWhInv[idx], stock: newWhInv[idx].stock - 1 }
+              const k = `${wh.id}|${row.model}|${row.color}|${row.size}`
+              updates[k] = { warehouse_id: wh.id, model: row.model, color: row.color, size: row.size, stock: newWhInv[idx].stock, reorder_level: newWhInv[idx].reorder_level || 10 }
+            }
+          }
+        }
+      }
+      const updateRows = Object.values(updates)
+      if (updateRows.length) {
+        const { error } = await sb.from('warehouse_inventory').upsert(updateRows, { onConflict: 'warehouse_id,model,color,size' })
+        if (error) throw new Error(error.message)
+      }
+      setWhInv(newWhInv)
+      toast(`✅ ${msCsvRows.length} Meesho orders deducted from stock`)
+      setMsCsvRows([]); setMsCsvHint('')
+    } catch (err) { toast('⚠️ ' + err.message) }
+    setMsCsvSaving(false)
   }
 
   // ── Generate plan ─────────────────────────────────
@@ -451,6 +538,55 @@ export default function Orders({ initialDate, setPage }) {
                 <div style={{ marginTop: '.65rem' }}>
                   <OrderList orders={msOrders} onRemove={i => setMsOrders(prev => prev.filter((_, j) => j !== i))} />
                   <Btn variant="ghost" size="sm" style={{ marginTop: '.4rem' }} onClick={() => { setMsOrders([]); setMsHint('') }}>✕ Clear Meesho orders</Btn>
+                </div>
+              )}
+
+              {/* Divider */}
+              <div style={{ height: 1, background: '#e9d5ff', margin: '1.25rem 0' }} />
+
+              {/* Meesho CSV — stock deduction */}
+              <div style={{ fontSize: '.82rem', fontWeight: 800, color: '#7e22ce', marginBottom: '.35rem' }}>📊 Meesho Orders CSV — Deduct Stock</div>
+              <div style={{ fontSize: '.72rem', color: '#9ca3af', marginBottom: '.65rem' }}>
+                Upload the Meesho orders report CSV to deduct stock for all shipped/delivered/cancelled orders.
+                Download from: Meesho Supplier Panel → <strong>Reports</strong> → Orders Report
+              </div>
+              <label style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', border: '2px dashed #e9d5ff', borderRadius: 10, padding: '1.25rem', background: '#faf5ff', cursor: 'pointer', position: 'relative', textAlign: 'center' }}>
+                <input ref={msCsvRef} type="file" accept=".csv,.xlsx,.xls" onChange={e => handleMsCsvFile(e.target.files[0])}
+                  style={{ position: 'absolute', inset: 0, opacity: 0, width: '100%', height: '100%', cursor: 'pointer' }} />
+                <div style={{ fontSize: '1.4rem', marginBottom: '.35rem' }}>📊</div>
+                <div style={{ fontWeight: 700, color: '#7e22ce', fontSize: '.82rem' }}>Drop Meesho Orders CSV here</div>
+                <div style={{ fontSize: '.7rem', color: '#94a3b8', marginTop: '.2rem' }}>All statuses deduct stock (Shipped, Delivered, Cancelled, RTO)</div>
+              </label>
+              {msCsvHint && <div style={{ marginTop: '.5rem', fontSize: '.75rem', fontWeight: 600, color: msCsvHint.startsWith('✓') ? '#059669' : '#64748b', textAlign: 'center' }}>{msCsvHint}</div>}
+              {msCsvRows.length > 0 && (
+                <div style={{ marginTop: '.75rem' }}>
+                  {/* SKU summary */}
+                  <div style={{ border: '1px solid #e9d5ff', borderRadius: 8, overflow: 'hidden', marginBottom: '.65rem' }}>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 60px 70px', padding: '.38rem .65rem', background: '#fdf4ff', fontSize: '.62rem', fontWeight: 700, color: '#7e22ce', textTransform: 'uppercase', letterSpacing: '.5px', borderBottom: '1px solid #e9d5ff' }}>
+                      <span>Model</span><span>Color</span><span>Size</span><span>Qty</span>
+                    </div>
+                    <div style={{ maxHeight: 200, overflowY: 'auto' }}>
+                      {Object.values(msCsvRows.reduce((acc, r) => {
+                        const k = `${r.model}|${r.color}|${r.size}`
+                        if (!acc[k]) acc[k] = { model: r.model, color: r.color, size: r.size, qty: 0 }
+                        acc[k].qty++
+                        return acc
+                      }, {})).sort((a,b)=>a.model.localeCompare(b.model)).map((s,i) => (
+                        <div key={i} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 60px 70px', padding: '.38rem .65rem', borderBottom: '1px solid #f3f4f6', fontSize: '.78rem', alignItems: 'center' }}>
+                          <span style={{ fontWeight: 700 }}><span style={{ background: '#eff6ff', color: '#1d4ed8', borderRadius: 4, padding: '1px 6px', fontSize: '.68rem', fontWeight: 700 }}>{s.model}</span></span>
+                          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><ColorDot color={s.color} />{s.color}</span>
+                          <span style={{ color: '#4f46e5', fontWeight: 700 }}>UK{s.size}</span>
+                          <span style={{ fontWeight: 800, color: '#dc2626' }}>−{s.qty}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', gap: '.5rem', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <Btn variant="ghost" size="sm" onClick={() => { setMsCsvRows([]); setMsCsvHint('') }}>✕ Clear</Btn>
+                    <Btn variant="meesho" size="md" onClick={confirmMsCsvDeduct} disabled={msCsvSaving}>
+                      {msCsvSaving ? '⏳ Saving…' : `✅ Deduct ${msCsvRows.length} Orders from Stock`}
+                    </Btn>
+                  </div>
                 </div>
               )}
             </div>
