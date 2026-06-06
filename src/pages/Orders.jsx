@@ -189,40 +189,90 @@ export default function Orders({ initialDate, setPage }) {
   }
 
   function parseMsCsv(text, fname) {
-    const lines = text.replace(/^﻿/,'').split('\n').map(l=>l.trim()).filter(l=>l)
+    const lines = text.replace(/^\uFEFF/,'').split('\n').map(l=>l.trim()).filter(l=>l)
     if (!lines.length) { setMsCsvHint('File is empty'); return }
     const headers = csvSplit(lines[0]).map(h=>h.trim())
     const idx = name => headers.findIndex(h=>h.toLowerCase().includes(name.toLowerCase()))
-    const iSKU = idx('SKU'), iSize = idx('Size'), iQty = idx('Quantity'), iStatus = idx('Reason for Credit')
+    const iSKU    = idx('SKU')
+    const iSize   = idx('Size')
+    const iQty    = idx('Quantity')
+    const iStatus = idx('Reason for Credit')
+    const iOrder  = idx('Sub Order')
+    const iDate   = idx('Order Date')
     if (iSKU < 0) { setMsCsvHint('Not a valid Meesho orders CSV'); return }
     const rows = []
     for (let i = 1; i < lines.length; i++) {
       const cols = csvSplit(lines[i])
       if (cols.length < 3) continue
-      const sku = cols[iSKU]?.trim() || ''
-      const sizeStr = iSize >= 0 ? cols[iSize]?.trim() : ''
-      const qty = iQty >= 0 ? (parseInt(cols[iQty]) || 1) : 1
-      const status = iStatus >= 0 ? cols[iStatus]?.trim().toUpperCase().replace(/\s+/g,'_') : 'SHIPPED'
+      const sku        = cols[iSKU]?.trim() || ''
+      const sizeStr    = iSize   >= 0 ? cols[iSize]?.trim()   : ''
+      const qty        = iQty    >= 0 ? (parseInt(cols[iQty]) || 1) : 1
+      const status     = iStatus >= 0 ? cols[iStatus]?.trim().toUpperCase().replace(/\s+/g,'_') : 'SHIPPED'
+      const subOrderNo = iOrder  >= 0 ? cols[iOrder]?.trim()  : ''
+      const orderDate  = iDate   >= 0 ? cols[iDate]?.trim()   : ''
       const parsed = parseYootsSKU(sku, whInv, sizeStr)
       if (!parsed) continue
-      for (let q = 0; q < qty; q++) rows.push({ ...parsed, platform: 'Meesho', status })
+      // Each row in CSV = 1 order (qty field usually 1, but handle >1)
+      for (let q = 0; q < qty; q++) {
+        rows.push({
+          ...parsed,
+          platform: 'Meesho',
+          status,
+          sub_order_no: qty > 1 ? `${subOrderNo}_${q}` : subOrderNo,
+          order_date: orderDate,
+          sku,
+          size_str: sizeStr,
+        })
+      }
     }
     if (!rows.length) { setMsCsvHint('No valid SKUs found'); return }
-    setMsCsvHint(`✓ ${rows.length} orders parsed — all will deduct stock`)
+    setMsCsvHint(`✓ ${rows.length} orders parsed — checking for duplicates…`)
     setMsCsvRows(rows)
   }
 
   async function confirmMsCsvDeduct() {
     if (!msCsvRows.length) return
-    if (!confirm(`Deduct stock for ${msCsvRows.length} Meesho orders?\nThis cannot be undone.`)) return
     setMsCsvSaving(true)
     try {
+      // ── Step 1: Check which sub order nos are already processed ──
+      const subOrderNos = msCsvRows.map(r => r.sub_order_no).filter(Boolean)
+      let alreadyProcessed = new Set()
+      if (subOrderNos.length > 0) {
+        const { data: existing } = await sb
+          .from('meesho_processed_orders')
+          .select('sub_order_no')
+          .in('sub_order_no', subOrderNos)
+        if (existing) existing.forEach(r => alreadyProcessed.add(r.sub_order_no))
+      }
+
+      // ── Step 2: Filter to only new orders ──
+      const newRows    = msCsvRows.filter(r => !r.sub_order_no || !alreadyProcessed.has(r.sub_order_no))
+      const skippedCnt = msCsvRows.length - newRows.length
+
+      if (!newRows.length) {
+        toast(`⚠️ All ${msCsvRows.length} orders already processed — nothing to deduct`)
+        setMsCsvSaving(false)
+        return
+      }
+
+      const msg = skippedCnt > 0
+        ? `Deduct stock for ${newRows.length} new orders?
+
+⚠️ ${skippedCnt} orders already processed — will be skipped.
+
+This cannot be undone.`
+        : `Deduct stock for ${newRows.length} Meesho orders?
+This cannot be undone.`
+      if (!confirm(msg)) { setMsCsvSaving(false); return }
+
+      // ── Step 3: Deduct stock for new orders only ──
       const priority = (settings.dispatch_priority||'huda_complex,aggarsain,huda_new').split(',')
       const whByCode = {}; warehouses.forEach(w => { whByCode[w.code] = w })
       const whPrio = [...priority.map(c=>whByCode[c]).filter(Boolean), ...warehouses.filter(w=>!priority.includes(w.code))]
       const newWhInv = whInv.map(r => ({ ...r }))
       const updates = {}
-      for (const row of msCsvRows) {
+
+      for (const row of newRows) {
         let rem = 1
         for (const wh of whPrio) {
           if (rem <= 0) break
@@ -246,13 +296,34 @@ export default function Orders({ initialDate, setPage }) {
           }
         }
       }
+
+      // ── Step 4: Save stock updates ──
       const updateRows = Object.values(updates)
       if (updateRows.length) {
-        const { error } = await sb.from('warehouse_inventory').upsert(updateRows, { onConflict: 'warehouse_id,model,color,size' })
-        if (error) throw new Error(error.message)
+        const { error: e1 } = await sb.from('warehouse_inventory').upsert(updateRows, { onConflict: 'warehouse_id,model,color,size' })
+        if (e1) throw new Error(e1.message)
       }
+
+      // ── Step 5: Record processed sub order nos ──
+      const toRecord = newRows
+        .filter(r => r.sub_order_no)
+        .map(r => ({
+          sub_order_no: r.sub_order_no,
+          sku:          r.sku || '',
+          size:         r.size_str || String(r.size),
+          status:       r.status,
+          order_date:   r.order_date || '',
+        }))
+      if (toRecord.length) {
+        const { error: e2 } = await sb.from('meesho_processed_orders').upsert(toRecord, { onConflict: 'sub_order_no' })
+        if (e2) throw new Error('Order log failed: ' + e2.message)
+      }
+
       setWhInv(newWhInv)
-      toast(`✅ ${msCsvRows.length} Meesho orders deducted from stock`)
+      const msg2 = skippedCnt > 0
+        ? `✅ ${newRows.length} orders deducted · ${skippedCnt} duplicates skipped`
+        : `✅ ${newRows.length} Meesho orders deducted from stock`
+      toast(msg2, 3500)
       setMsCsvRows([]); setMsCsvHint('')
     } catch (err) { toast('⚠️ ' + err.message) }
     setMsCsvSaving(false)
@@ -584,7 +655,7 @@ export default function Orders({ initialDate, setPage }) {
                   <div style={{ display: 'flex', gap: '.5rem', justifyContent: 'space-between', alignItems: 'center' }}>
                     <Btn variant="ghost" size="sm" onClick={() => { setMsCsvRows([]); setMsCsvHint('') }}>✕ Clear</Btn>
                     <Btn variant="meesho" size="md" onClick={confirmMsCsvDeduct} disabled={msCsvSaving}>
-                      {msCsvSaving ? '⏳ Saving…' : `✅ Deduct ${msCsvRows.length} Orders from Stock`}
+                      {msCsvSaving ? '⏳ Checking duplicates & saving…' : `✅ Confirm & Deduct Stock`}
                     </Btn>
                   </div>
                 </div>
